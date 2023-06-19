@@ -1,0 +1,83 @@
+
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from torch.nn import CrossEntropyLoss
+from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
+from tqdm import tqdm
+from transformers import BertForTokenClassification, BertTokenizer, AdamW, get_linear_schedule_with_warmup
+import time
+from torch.utils.data import TensorDataset, DataLoader
+import csv
+
+def predict_tags(data_file, model_address):
+    num_labels = 40
+    batch_size = 16
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+    model = BertForTokenClassification.from_pretrained(
+        'bert-base-uncased',
+        num_labels=num_labels,
+        gradient_checkpointing=True,
+    )
+
+    model.load_state_dict(torch.load(model_address, map_location=device))
+    model = model.to(device)
+
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+    with open(data_file, 'r', encoding='utf-8') as file:
+        df = pd.read_csv(file, delimiter='\t', header=0, quoting=csv.QUOTE_NONE, engine='python')
+    df.columns = ['Record Number', 'Title', 'Token', 'Tag']
+    df['Tag'] = df['Tag'].fillna('No Tag').apply(lambda x: ['No Tag' if tag == 'No Tag' else tag for tag in x.split()])
+
+    le = LabelEncoder()
+    all_labels = [['No Tag']] + list(df['Tag'].values)
+    flattened_labels = [item for sublist in all_labels for item in sublist]
+    le.fit(flattened_labels)
+
+    grouped = df.groupby('Record Number').agg({'Token': lambda x: list(x), 'Tag': lambda x: list(x), 'Title': 'first'}).reset_index()
+
+    titles = grouped['Title'].values
+    max_length = 512
+    input_ids = []
+    attention_masks = []
+
+    for title in titles:
+        encodings = tokenizer(title, add_special_tokens=True, max_length=max_length, padding='max_length', truncation=True)
+        input_ids.append(encodings['input_ids'])
+        attention_masks.append(encodings['attention_mask'])
+
+    input_ids = torch.tensor(input_ids).to(device)
+    attention_masks = torch.tensor(attention_masks).to(device)
+
+    data_loader = DataLoader(TensorDataset(input_ids, attention_masks), batch_size=batch_size)
+
+    model = model.eval()
+    predictions = []
+    with torch.no_grad():
+        for batch in data_loader:
+            batch = tuple(t.to(device) for t in batch)
+            b_input_ids, b_input_mask = batch
+
+            outputs = model(b_input_ids, token_type_ids=None, attention_mask=b_input_mask)
+            logits = outputs[0]
+            batch_predictions = torch.argmax(logits, dim=-1).cpu().numpy()
+
+            for pred in batch_predictions:
+                predictions.append(pred)
+
+    flattened_predictions = [item for sublist in predictions for item in sublist]
+    predicted_labels = le.inverse_transform(flattened_predictions)
+
+    for title, labels in zip(titles, np.array_split(predicted_labels, len(titles))):
+        print(f'Title: {title}, Predicted Tags: {labels.tolist()}')
+        time.sleep(1)
+
+predict_tags('Train_Tagged_Titles.tsv', 'model_save.pth')
+
+if '__main__' == 'main':
+    pass
